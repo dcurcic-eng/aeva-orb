@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AEVA — Gyroscope Particles (R3F)</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#05070c; overflow:hidden; font-family:'Segoe UI', system-ui, sans-serif; }
+  #root { width:100%; height:100%; }
+  .loading { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    color:#5f7d8c; font-size:12px; letter-spacing:3px; text-transform:uppercase; z-index:5; }
+  .badge { position:fixed; left:18px; bottom:16px; color:#4d7686; font-size:11px; letter-spacing:2px;
+    text-transform:uppercase; z-index:6; opacity:.7; pointer-events:none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+    "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
+    "three": "https://esm.sh/three@0.160.0",
+    "three/examples/jsm/loaders/SVGLoader.js": "https://esm.sh/three@0.160.0/examples/jsm/loaders/SVGLoader.js?external=three",
+    "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.17.10?external=react,react-dom,three",
+    "@react-three/drei": "https://esm.sh/@react-three/drei@9.114.3?external=react,react-dom,three,@react-three/fiber",
+    "@react-three/postprocessing": "https://esm.sh/@react-three/postprocessing@2.16.3?external=react,three,@react-three/fiber"
+  }
+}
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div class="loading" id="loading">Loading…</div>
+<div class="badge">AEVA · Gyroscope · Particles</div>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useRef, useMemo, useEffect, Suspense } from 'react'
+import { createRoot } from 'react-dom/client'
+import * as THREE from 'three'
+import { SVGLoader } from 'three/examples/jsm/loaders/SVGLoader.js'
+import { Canvas, useFrame } from '@react-three/fiber'
+import { OrbitControls } from '@react-three/drei'
+import { EffectComposer, Bloom, Vignette } from '@react-three/postprocessing'
+
+/* ============================================================
+   Palette — cyan neon particles floating on deep space blue
+   ============================================================ */
+const CYAN      = new THREE.Color('#3fdcff')
+const CYAN_DEEP = new THREE.Color('#18b8e8')
+const ICE       = new THREE.Color('#dff4ff')
+
+/* Soft round sprite so each particle is a glowing dot, not a hard square */
+function makeDotTexture() {
+  const s = 64
+  const c = document.createElement('canvas'); c.width = c.height = s
+  const ctx = c.getContext('2d')
+  const g = ctx.createRadialGradient(s/2, s/2, 0, s/2, s/2, s/2)
+  g.addColorStop(0.0, 'rgba(255,255,255,1)')
+  g.addColorStop(0.25, 'rgba(255,255,255,0.85)')
+  g.addColorStop(0.6, 'rgba(255,255,255,0.25)')
+  g.addColorStop(1.0, 'rgba(255,255,255,0)')
+  ctx.fillStyle = g; ctx.fillRect(0, 0, s, s)
+  const t = new THREE.CanvasTexture(c)
+  t.needsUpdate = true
+  return t
+}
+const DOT = makeDotTexture()
+
+/* Evenly sample points across the SURFACE of a geometry
+   (area-weighted, self-contained — no external sampler dependency) */
+function sampleSurface(geometry, count) {
+  const geo = geometry.index ? geometry.toNonIndexed() : geometry
+  const pos = geo.attributes.position
+  const triCount = Math.floor(pos.count / 3)
+  const areas = new Float32Array(triCount)
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3()
+  const ab = new THREE.Vector3(), ac = new THREE.Vector3(), cr = new THREE.Vector3()
+  let total = 0
+  for (let i = 0; i < triCount; i++) {
+    a.fromBufferAttribute(pos, i*3); b.fromBufferAttribute(pos, i*3+1); c.fromBufferAttribute(pos, i*3+2)
+    ab.subVectors(b, a); ac.subVectors(c, a); cr.crossVectors(ab, ac)
+    total += cr.length() * 0.5
+    areas[i] = total
+  }
+  const positions = new Float32Array(count * 3)
+  const colors = new Float32Array(count * 3)
+  const tmp = new THREE.Color()
+  for (let k = 0; k < count; k++) {
+    const r = Math.random() * total
+    let lo = 0, hi = triCount - 1
+    while (lo < hi) { const m = (lo + hi) >> 1; if (areas[m] < r) lo = m + 1; else hi = m }
+    const i = lo
+    a.fromBufferAttribute(pos, i*3); b.fromBufferAttribute(pos, i*3+1); c.fromBufferAttribute(pos, i*3+2)
+    let u = Math.random(), v = Math.random()
+    if (u + v > 1) { u = 1 - u; v = 1 - v }
+    positions[k*3]   = a.x + u*(b.x-a.x) + v*(c.x-a.x)
+    positions[k*3+1] = a.y + u*(b.y-a.y) + v*(c.y-a.y)
+    positions[k*3+2] = a.z + u*(b.z-a.z) + v*(c.z-a.z)
+    // shimmer: blend icy white toward cyan, random brightness
+    tmp.copy(ICE).lerp(CYAN, Math.random() * 0.85)
+    const bri = 0.55 + Math.random() * 0.55
+    colors[k*3] = tmp.r * bri; colors[k*3+1] = tmp.g * bri; colors[k*3+2] = tmp.b * bri
+  }
+  return { positions, colors }
+}
+
+/* A geometry rendered as a transparent glowing particle cloud */
+function Particles({ geometry, count, size = 0.026, opacity = 0.95, ...props }) {
+  const { positions, colors } = useMemo(() => sampleSurface(geometry, count), [geometry, count])
+  return (
+    <points {...props}>
+      <bufferGeometry>
+        <bufferAttribute attach="attributes-position" count={count} array={positions} itemSize={3} />
+        <bufferAttribute attach="attributes-color" count={count} array={colors} itemSize={3} />
+      </bufferGeometry>
+      <pointsMaterial
+        map={DOT} size={size} vertexColors transparent opacity={opacity}
+        sizeAttenuation depthWrite={false} blending={THREE.AdditiveBlending} toneMapped={false} />
+    </points>
+  )
+}
+
+/* ============================================================
+   Geometry helper — flat rectangular-section ring (annulus)
+   ============================================================ */
+function ringGeo(inner, outer, depth) {
+  const s = new THREE.Shape()
+  s.absarc(0, 0, outer, 0, Math.PI * 2, false)
+  const h = new THREE.Path()
+  h.absarc(0, 0, inner, 0, Math.PI * 2, true)
+  s.holes.push(h)
+  const g = new THREE.ExtrudeGeometry(s, {
+    depth, bevelEnabled: true, bevelThickness: 0.012, bevelSize: 0.012,
+    bevelSegments: 2, curveSegments: 128
+  })
+  g.translate(0, 0, -depth / 2)
+  return g
+}
+
+/* ============================================================
+   AEVA "A" mark — extruded SVG, gradient baked into vertex colors,
+   sits glowing at the centre of the orb and spins on its own.
+   ============================================================ */
+const SVG_A = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 551 541">
+<path d="M111.369 282.731C116.625 261.482 127.872 254.94 144.912 256.268C161.472 257.596 178.23 256.526 201.685 256.526C185.747 297.63 171.9 333.355 156.781 372.418H391.163C335.83 247.004 282.279 125.639 226.949 0.257968C256.847 0.257968 282.082 -0.64895 307.204 0.938156C312.969 1.32683 320.769 8.71173 323.622 15.1573C397.973 183.423 471.786 351.98 545.57 520.57C547.52 525.04 548.254 530.253 550.826 539.81C523.414 539.81 498.405 541.073 473.594 538.903C467.688 538.384 459.522 527.502 457.542 519.695C443.215 463.823 411.452 450.348 362.564 454.073C289.881 459.612 216.605 455.855 143.613 455.238C127.985 455.078 119.112 459.677 111.991 477.555C86.6989 541.267 85.9357 540.877 24.6136 540.068C17.9445 539.939 11.2754 539.161 0 538.352C37.8671 451.417 74.2083 367.915 111.369 282.568V282.731Z"/>
+</svg>`
+const LOGO_DARK  = new THREE.Color('#2F6873')
+const LOGO_LIGHT = new THREE.Color('#7fe6ff')
+
+function buildLogoGeometry(height = 0.24) {
+  const data = new SVGLoader().parse(SVG_A)
+  const shapes = data.paths.flatMap(p => SVGLoader.createShapes(p))
+  const geometry = new THREE.ExtrudeGeometry(shapes, {
+    depth: 80, steps: 1, curveSegments: 24,
+    bevelEnabled: true, bevelThickness: 7, bevelSize: 7, bevelSegments: 5
+  })
+  const scale = height / 541
+  geometry.scale(scale, scale, scale)
+  geometry.center()
+  // bake brand gradient into vertex colors (SVG space is y-down)
+  geometry.computeBoundingBox()
+  const bb = geometry.boundingBox
+  const pos = geometry.getAttribute('position')
+  const colors = new Float32Array(pos.count * 3)
+  const tmp = new THREE.Color()
+  const h = bb.max.y - bb.min.y, w = bb.max.x - bb.min.x
+  for (let i = 0; i < pos.count; i++) {
+    const ty = (bb.max.y - pos.getY(i)) / h
+    const tx = (pos.getX(i) - bb.min.x) / w
+    tmp.lerpColors(LOGO_DARK, LOGO_LIGHT, THREE.MathUtils.clamp(0.85 * ty + 0.15 * tx, 0, 1))
+    colors[i*3] = tmp.r; colors[i*3+1] = tmp.g; colors[i*3+2] = tmp.b
+  }
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  return geometry
+}
+
+function LogoCore() {
+  const ref = useRef()
+  const geometry = useMemo(() => buildLogoGeometry(0.24), [])
+  useEffect(() => () => geometry.dispose(), [geometry])
+  useFrame((_, delta) => { ref.current.rotation.y += delta * 0.9 })
+  return (
+    <group ref={ref}>
+      {/* SVG is y-down; flip upright with a 180° X rotation */}
+      <mesh geometry={geometry} rotation={[Math.PI, 0, 0]}>
+        <meshStandardMaterial
+          vertexColors emissive={'#59C4D9'} emissiveIntensity={0.9}
+          metalness={0.35} roughness={0.25} toneMapped={false} />
+      </mesh>
+    </group>
+  )
+}
+
+/* ============================================================
+   Gimbal — the spinning part only. Three nested rings each spin
+   continuously around their own axis; chrome is now particles.
+   ============================================================ */
+function Gimbal() {
+  const g1 = useRef()    // outer ring  → spins on horizontal X pivot axis
+  const g2 = useRef()    // middle ring → spins on its vertical Y axis
+  const rotor = useRef() // core rotor  → fast spin on its own spindle
+  const halo = useRef()
+
+  useFrame((state, delta) => {
+    const t = state.clock.elapsedTime
+    g1.current.rotation.x += delta * 0.32
+    g2.current.rotation.y += delta * 0.55
+    rotor.current.rotation.y += delta * 2.1
+    if (halo.current) halo.current.material.opacity = 0.16 + Math.sin(t * 2.4) * 0.05
+  })
+
+  /* ---- shared geometries ---- */
+  const outerGeo = useMemo(() => ringGeo(1.38, 1.52, 0.10), [])
+  const midGeo   = useMemo(() => ringGeo(1.08, 1.20, 0.08), [])
+  const bandGeo  = useMemo(() => ringGeo(0.72, 1.02, 0.05), [])
+  const innerGeo = useMemo(() => ringGeo(0.58, 0.66, 0.05), [])
+  const spindleGeo = useMemo(() => new THREE.CylinderGeometry(0.026, 0.026, 2.06, 20), [])
+  const collarGeo  = useMemo(() => new THREE.CylinderGeometry(0.05, 0.05, 0.10, 20), [])
+  const spokeGeo   = useMemo(() => new THREE.CylinderGeometry(0.022, 0.022, 0.53, 16), [])
+  const bearGeo    = useMemo(() => new THREE.CylinderGeometry(0.034, 0.034, 0.20, 18), [])
+  const stubGeo    = useMemo(() => new THREE.CylinderGeometry(0.045, 0.045, 0.24, 18), [])
+  const ballGeo    = useMemo(() => new THREE.SphereGeometry(0.055, 20, 20), [])
+  const coreGeo    = useMemo(() => new THREE.SphereGeometry(0.19, 48, 48), [])
+
+  /* thin cyan neon edge loops keep the ring silhouettes readable */
+  const glowMat = useMemo(() => new THREE.MeshStandardMaterial({
+    color: '#02222e', emissive: CYAN, emissiveIntensity: 2.6, toneMapped: false, metalness: 0, roughness: 0.4
+  }), [])
+  const glowSoftMat = useMemo(() => new THREE.MeshStandardMaterial({
+    color: '#02222e', emissive: CYAN_DEEP, emissiveIntensity: 1.5, toneMapped: false, metalness: 0, roughness: 0.5
+  }), [])
+
+  const GlowLoop = ({ r, tube = 0.010, rot = [0, 0, 0], mat = glowMat }) => (
+    <mesh rotation={rot} material={mat}>
+      <torusGeometry args={[r, tube, 10, 160]} />
+    </mesh>
+  )
+
+  const BallP = ({ p, r = 1 }) => (
+    <Particles geometry={ballGeo} count={Math.round(200 * r)} size={0.02} position={p} />
+  )
+
+  return (
+    <group>
+      {/* rotating AEVA logo, glowing at the dead centre of the orb */}
+      <LogoCore />
+
+      {/* ------ outer gimbal: full revolutions about the X pivot axis ------ */}
+      <group ref={g1}>
+        <Particles geometry={outerGeo} count={6500} size={0.028} />
+        <GlowLoop r={1.40} />
+        {/* stub shafts where the ring used to meet the yoke hubs */}
+        {[1, -1].map(s => (
+          <Particles key={s} geometry={stubGeo} count={400} size={0.02}
+                     position={[s * 1.58, 0, 0]} rotation={[0, 0, Math.PI / 2]} />
+        ))}
+        {/* bearings for the middle ring, top & bottom */}
+        {[1, -1].map(s => (
+          <group key={s}>
+            <Particles geometry={bearGeo} count={450} size={0.02} position={[0, s * 1.29, 0]} />
+            <BallP p={[0, s * 1.36, 0]} r={1.1} />
+          </group>
+        ))}
+
+        {/* ------ middle gimbal: continuous spin about vertical Y ------ */}
+        <group ref={g2}>
+          <Particles geometry={midGeo} count={5000} size={0.026} />
+          <GlowLoop r={1.10} tube={0.009} />
+          {[1, -1].map(s => <BallP key={s} p={[0, s * 1.05, 0]} r={1} />)}
+
+          {/* ------ rotor: fast spin around its own spindle ------ */}
+          <group ref={rotor}>
+            {/* wide flat equatorial band */}
+            <Particles geometry={bandGeo} count={5500} size={0.024} rotation={[Math.PI / 2, 0, 0]} />
+            <GlowLoop r={0.735} tube={0.011} rot={[Math.PI / 2, 0, 0]} />
+            <GlowLoop r={1.005} tube={0.008} rot={[Math.PI / 2, 0, 0]} mat={glowSoftMat} />
+
+            {/* inner vertical ring */}
+            <Particles geometry={innerGeo} count={2600} size={0.022} />
+            <GlowLoop r={0.60} tube={0.008} mat={glowSoftMat} />
+
+            {/* vertical spindle */}
+            <Particles geometry={spindleGeo} count={1100} size={0.02} />
+            {[0.26, -0.26].map(y => (
+              <Particles key={y} geometry={collarGeo} count={220} size={0.02} position={[0, y, 0]} />
+            ))}
+
+            {/* four spokes with ball joints, orb → flat band */}
+            {[0, 1, 2, 3].map(k => {
+              const a = (k * Math.PI) / 2
+              const dx = Math.round(Math.cos(a)), dz = Math.round(Math.sin(a))
+              return (
+                <group key={k}>
+                  <Particles geometry={spokeGeo} count={420} size={0.02}
+                    position={[dx * 0.445, 0, dz * 0.445]}
+                    rotation={[dz !== 0 ? Math.PI / 2 : 0, 0, dx !== 0 ? Math.PI / 2 : 0]} />
+                  <BallP p={[dx * 0.70, 0, dz * 0.70]} r={0.9} />
+                  <BallP p={[dx * 0.34, 0, dz * 0.34]} r={0.6} />
+                </group>
+              )
+            })}
+
+            {/* glowing plasma core — translucent particle shell wrapping
+                the rotating AEVA logo, plus a soft halo */}
+            <Particles geometry={coreGeo} count={4200} size={0.03} opacity={0.85} />
+            <mesh ref={halo}>
+              <sphereGeometry args={[0.30, 32, 32]} />
+              <meshBasicMaterial color={'#3fdcff'} transparent opacity={0.16}
+                blending={THREE.AdditiveBlending} depthWrite={false} toneMapped={false} />
+            </mesh>
+            <pointLight color={'#3fdcff'} intensity={2.6} distance={7} decay={2} />
+          </group>
+        </group>
+      </group>
+    </group>
+  )
+}
+
+/* ============================================================
+   App — floating gimbal, deep dark studio, bloom for the glow
+   ============================================================ */
+function App() {
+  useEffect(() => {
+    const el = document.getElementById('loading')
+    if (el) el.style.display = 'none'
+  }, [])
+
+  return (
+    <Canvas dpr={[1, 2]} gl={{ antialias: true }}
+            camera={{ position: [0.4, 1.1, 6.4], fov: 34 }}>
+      <color attach="background" args={['#05070c']} />
+      <fog attach="fog" args={['#05070c', 10, 26]} />
+      <ambientLight intensity={0.4} />
+      <Suspense fallback={null}>
+        <Gimbal />
+        <EffectComposer multisampling={4}>
+          <Bloom luminanceThreshold={0.15} luminanceSmoothing={0.3} intensity={1.15} mipmapBlur radius={0.8} />
+          <Vignette offset={0.24} darkness={0.7} />
+        </EffectComposer>
+        <OrbitControls target={[0, 0, 0]} enableDamping dampingFactor={0.08}
+          autoRotate autoRotateSpeed={0.5} minDistance={3} maxDistance={16}
+          maxPolarAngle={Math.PI * 0.9} minPolarAngle={Math.PI * 0.1} />
+      </Suspense>
+    </Canvas>
+  )
+}
+
+createRoot(document.getElementById('root')).render(<App />)
+</script>
+</body>
+</html>

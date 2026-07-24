@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Particle Orb — AEVA Logo Inside</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #e7eaed; }
+  canvas { display: block; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<script type="module">
+import * as THREE from 'three';
+import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+// ---------- Scene ----------
+const BG = new THREE.Color('#e7eaed');
+const scene = new THREE.Scene();
+scene.background = BG;
+
+const camera = new THREE.PerspectiveCamera(40, innerWidth / innerHeight, 0.1, 100);
+camera.position.set(0, 0, 4.2);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2)); // cap DPR
+document.body.appendChild(renderer.domElement);
+
+const DPR = Math.min(devicePixelRatio, 2).toFixed(1);
+
+// Image-based lighting for the logo (shader-material orb ignores it)
+{
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+}
+
+// ---------- Shared GLSL: simplex noise + displacement + cursor field ----------
+const NOISE_GLSL = /* glsl */`
+vec3 mod289(vec3 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+vec4 mod289(vec4 x){ return x - floor(x * (1.0/289.0)) * 289.0; }
+vec4 permute(vec4 x){ return mod289(((x*34.0)+1.0)*x); }
+vec4 taylorInvSqrt(vec4 r){ return 1.79284291400159 - 0.85373472095314 * r; }
+float snoise(vec3 v){
+  const vec2 C = vec2(1.0/6.0, 1.0/3.0);
+  const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+  vec3 i  = floor(v + dot(v, C.yyy));
+  vec3 x0 = v - i + dot(i, C.xxx);
+  vec3 g = step(x0.yzx, x0.xyz);
+  vec3 l = 1.0 - g;
+  vec3 i1 = min(g.xyz, l.zxy);
+  vec3 i2 = max(g.xyz, l.zxy);
+  vec3 x1 = x0 - i1 + C.xxx;
+  vec3 x2 = x0 - i2 + C.yyy;
+  vec3 x3 = x0 - D.yyy;
+  i = mod289(i);
+  vec4 p = permute(permute(permute(
+            i.z + vec4(0.0, i1.z, i2.z, 1.0))
+          + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+          + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+  float n_ = 0.142857142857;
+  vec3 ns = n_ * D.wyz - D.xzx;
+  vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+  vec4 x_ = floor(j * ns.z);
+  vec4 y_ = floor(j - 7.0 * x_);
+  vec4 x = x_ * ns.x + ns.yyyy;
+  vec4 y = y_ * ns.x + ns.yyyy;
+  vec4 h = 1.0 - abs(x) - abs(y);
+  vec4 b0 = vec4(x.xy, y.xy);
+  vec4 b1 = vec4(x.zw, y.zw);
+  vec4 s0 = floor(b0) * 2.0 + 1.0;
+  vec4 s1 = floor(b1) * 2.0 + 1.0;
+  vec4 sh = -step(h, vec4(0.0));
+  vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+  vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+  vec3 p0 = vec3(a0.xy, h.x);
+  vec3 p1 = vec3(a0.zw, h.y);
+  vec3 p2 = vec3(a1.xy, h.z);
+  vec3 p3 = vec3(a1.zw, h.w);
+  vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+  p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+  vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+  m = m * m;
+  return 42.0 * dot(m*m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+}
+
+uniform float uTime;
+uniform float uAmp;
+uniform float uFreq;
+uniform float uHover;   // 0 = cursor away, 1 = hovering
+uniform float uRadius;  // size of the split zone around the cursor
+uniform vec3 uMouse;    // object-space cursor point on the orb
+
+float displace(vec3 p){
+  float n = snoise(p * uFreq + vec3(0.0, uTime * 0.12, uTime * 0.08));
+  n += 0.35 * snoise(p * uFreq * 2.6 + vec3(uTime * 0.18, 0.0, 0.0));
+  return n * uAmp;
+}
+
+// Cursor repulsion field: 1 at the cursor, 0 beyond uRadius
+float mouseField(vec3 p){
+  float f = 1.0 - smoothstep(0.0, uRadius, distance(p, uMouse));
+  return f * f;
+}
+
+uniform vec3 uSplitN; // split plane normal (object space, unit)
+
+// How much the split gap is open at point p: 1 at the seam under the
+// cursor, falling off with distance from cursor and from the seam plane
+float splitMask(vec3 p){
+  float s = abs(dot(p - uMouse, uSplitN));
+  float band = 1.0 - smoothstep(0.0, uRadius * 0.9, s);
+  return mouseField(p) * band;
+}
+`;
+
+const uniforms = {
+  uTime:   { value: 0 },
+  uAmp:    { value: 0.075 },
+  uFreq:   { value: 1.35 },
+  uHover:  { value: 0 },
+  uRadius: { value: 0.9 },
+  uMouse:  { value: new THREE.Vector3(0, 0, 1.2) },
+  uSplitN: { value: new THREE.Vector3(1, 0, 0) },
+  uColor:  { value: new THREE.Color('#2fb5d8') },
+  uRim:    { value: new THREE.Color('#9fe6f5') },
+};
+
+// ---------- The orb: a volumetric cloud of particles ----------
+const P_COUNT = 110000;
+const pPos = new Float32Array(P_COUNT * 3);
+const pRand = new Float32Array(P_COUNT * 3);
+for (let i = 0; i < P_COUNT; i++) {
+  // Uniform random direction
+  let x, y, z, len;
+  do {
+    x = Math.random() * 2 - 1; y = Math.random() * 2 - 1; z = Math.random() * 2 - 1;
+    len = Math.hypot(x, y, z);
+  } while (len < 0.0001 || len > 1);
+  // Radius biased toward the surface, with some depth so the ball reads volumetric
+  const r = 1.0 - 0.22 * Math.pow(Math.random(), 1.6);
+  pPos[i * 3]     = (x / len) * r;
+  pPos[i * 3 + 1] = (y / len) * r;
+  pPos[i * 3 + 2] = (z / len) * r;
+  pRand[i * 3]     = Math.random();
+  pRand[i * 3 + 1] = Math.random();
+  pRand[i * 3 + 2] = Math.random();
+}
+const cloudGeometry = new THREE.BufferGeometry();
+cloudGeometry.setAttribute('position', new THREE.BufferAttribute(pPos, 3));
+cloudGeometry.setAttribute('aRand', new THREE.BufferAttribute(pRand, 3));
+
+const cloudMaterial = new THREE.ShaderMaterial({
+  uniforms,
+  transparent: true,
+  depthWrite: false,
+  vertexShader: NOISE_GLSL + /* glsl */`
+    attribute vec3 aRand;
+    uniform vec3 uColor;
+    varying float vA;
+    varying vec3 vCol;
+    void main(){
+      vec3 dir = normalize(position);
+      float r = length(position);
+      // Follow the same lumpy surface noise as the original orb
+      vec3 base = dir * r * (1.0 + displace(dir));
+
+      // Gentle perpetual shimmer so the cloud feels alive
+      base += 0.018 * vec3(
+        snoise(base * 3.0 + vec3(uTime * 0.20, 0.0, aRand.x * 5.0)),
+        snoise(base * 3.0 + vec3(0.0, uTime * 0.22, aRand.y * 5.0)),
+        snoise(base * 3.0 + vec3(aRand.z * 5.0, uTime * 0.18, 0.0)));
+
+      // The cursor splits the cloud: the two sides of the seam plane part
+      // in opposite directions, opening a gap right where the mouse is
+      float f = splitMask(base) * uHover;
+      float side = dot(base - uMouse, uSplitN);
+      side = side >= 0.0 ? 1.0 : -1.0;
+      vec3 away = normalize(base - uMouse + vec3(0.0001));
+      vec3 turb = vec3(
+        snoise(base * 2.2 + vec3(0.0, uTime * 0.5, aRand.y * 7.0)),
+        snoise(base * 2.2 + vec3(aRand.z * 7.0, uTime * 0.45, 0.0)),
+        snoise(base * 2.2 + vec3(uTime * 0.4, 0.0, aRand.x * 7.0)));
+      vec3 p = base
+        + uSplitN * side * (0.55 + 0.45 * aRand.y) * f  // part along the seam
+        + away * 0.16 * f                               // slight outward bulge
+        + turb * 0.24 * f;                              // ragged organic edges
+
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      gl_PointSize = (1.1 + aRand.z * 1.5) * (300.0 / -mv.z) * 0.01 * min(2.0, ${DPR});
+      gl_PointSize = max(gl_PointSize, 1.0);
+      gl_Position = projectionMatrix * mv;
+
+      // Saturated teal at the silhouette, milky white-cyan toward the center
+      vec3 nView = normalize(normalMatrix * dir);
+      vec3 viewDir = normalize(-mv.xyz);
+      float facing = clamp(dot(viewDir, nView), 0.0, 1.0);
+      float shellDepth = smoothstep(0.75, 1.0, r);
+      float baseA = (0.14 + 0.3 * aRand.x * mix(0.55, 1.0, shellDepth))
+                  * (0.75 + 0.55 * (1.0 - facing)); // denser edge
+      // Pushed particles flare brighter and whiter
+      vA = baseA + f * 0.4;
+      float whiten = 0.12 + 0.62 * pow(facing, 1.6) + f * 0.4;
+      vCol = mix(uColor, vec3(1.0), clamp(whiten, 0.0, 0.92));
+    }
+  `,
+  fragmentShader: /* glsl */`
+    varying float vA;
+    varying vec3 vCol;
+    void main(){
+      float d = length(gl_PointCoord - 0.5);
+      float a = smoothstep(0.5, 0.18, d) * vA;
+      if (a < 0.01) discard;
+      gl_FragColor = vec4(vCol, min(a, 0.95));
+    }
+  `,
+});
+const cloud = new THREE.Points(cloudGeometry, cloudMaterial);
+cloud.renderOrder = 1;
+cloud.frustumCulled = false;
+
+// ---------- Ordered dot grid on the surface (the water-drop texture) ----------
+const gridGeometry = new THREE.SphereGeometry(1, 168, 84);
+{
+  const count = gridGeometry.attributes.position.count;
+  const gRand = new Float32Array(count * 3);
+  for (let i = 0; i < count * 3; i++) gRand[i] = Math.random();
+  gridGeometry.setAttribute('aRand', new THREE.BufferAttribute(gRand, 3));
+}
+const gridMaterial = new THREE.ShaderMaterial({
+  uniforms,
+  transparent: true,
+  depthWrite: false,
+  vertexShader: NOISE_GLSL + /* glsl */`
+    attribute vec3 aRand;
+    varying float vA;
+    void main(){
+      vec3 dir = normalize(position);
+      vec3 base = dir * (1.0 + displace(dir)) * 1.006; // just above the surface
+
+      // Same split behavior as the cloud so the grid parts with it
+      float f = splitMask(base) * uHover;
+      float side = dot(base - uMouse, uSplitN) >= 0.0 ? 1.0 : -1.0;
+      vec3 away = normalize(base - uMouse + vec3(0.0001));
+      vec3 turb = vec3(
+        snoise(base * 2.2 + vec3(0.0, uTime * 0.5, aRand.y * 7.0)),
+        snoise(base * 2.2 + vec3(aRand.z * 7.0, uTime * 0.45, 0.0)),
+        snoise(base * 2.2 + vec3(uTime * 0.4, 0.0, aRand.x * 7.0)));
+      vec3 p = base
+        + uSplitN * side * (0.55 + 0.45 * aRand.y) * f
+        + away * 0.16 * f
+        + turb * 0.24 * f;
+
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      gl_PointSize = 2.6 * (300.0 / -mv.z) * 0.01 * min(2.0, ${DPR});
+      gl_PointSize = max(gl_PointSize, 1.3);
+      gl_Position = projectionMatrix * mv;
+
+      // Crisp on the front face, fading toward the rim
+      vec3 nView = normalize(normalMatrix * dir);
+      vec3 viewDir = normalize(-mv.xyz);
+      float facing = clamp(dot(viewDir, nView), 0.0, 1.0);
+      vA = smoothstep(0.04, 0.5, facing) * 0.8 + f * 0.25;
+    }
+  `,
+  fragmentShader: /* glsl */`
+    varying float vA;
+    void main(){
+      float d = length(gl_PointCoord - 0.5);
+      float a = smoothstep(0.5, 0.24, d) * vA;
+      if (a < 0.01) discard;
+      gl_FragColor = vec4(1.0, 1.0, 1.0, a);
+    }
+  `,
+});
+const grid = new THREE.Points(gridGeometry, gridMaterial);
+grid.renderOrder = 2;
+grid.frustumCulled = false;
+
+// ---------- Faint frosted rim shell (just a whisper of the glass look) ----------
+const shellMaterial = new THREE.ShaderMaterial({
+  uniforms,
+  transparent: true,
+  depthWrite: false,
+  side: THREE.FrontSide,
+  vertexShader: NOISE_GLSL + /* glsl */`
+    varying vec3 vNormal;
+    varying vec3 vWorldPos;
+    varying vec3 vPos;
+    varying float vF;
+    void main(){
+      vec3 displaced = position + normal * displace(position);
+      vec3 t = normalize(cross(normal, vec3(0.0, 1.0, 0.001)));
+      vec3 b = normalize(cross(normal, t));
+      float e = 0.02;
+      vec3 pt = position + t * e; pt += normal * displace(pt);
+      vec3 pb = position + b * e; pb += normal * displace(pb);
+      vNormal = normalize(normalMatrix * normalize(cross(pt - displaced, pb - displaced)));
+      vPos = position;
+      vF = splitMask(displaced) * uHover;
+      vec4 wp = modelMatrix * vec4(displaced, 1.0);
+      vWorldPos = wp.xyz;
+      gl_Position = projectionMatrix * viewMatrix * wp;
+    }
+  `,
+  fragmentShader: NOISE_GLSL + /* glsl */`
+    uniform vec3 uRim;
+    varying vec3 vNormal;
+    varying vec3 vWorldPos;
+    varying vec3 vPos;
+    varying float vF;
+    void main(){
+      vec3 V = normalize(cameraPosition - vWorldPos);
+      float facing = clamp(dot(V, normalize(vNormal)), 0.0, 1.0);
+      float rimBand = smoothstep(0.25, 0.9, pow(1.0 - facing, 1.8));
+      // Soft glare upper right
+      vec3 L = normalize(vec3(0.7, 0.5, 0.45));
+      float ndl = max(dot(normalize(vNormal), L), 0.0);
+      float glare = pow(ndl, 12.0) * 0.35;
+      // The shell disintegrates with a noisy breakup only around the cursor;
+      // the rest of the rim stays intact
+      float n = snoise(vPos * 2.6 + vec3(0.0, uTime * 0.08, 0.0)) * 0.5 + 0.5;
+      float d = vF * 1.8;
+      float diss = smoothstep(n - 0.25, n + 0.05, d);
+      float alpha = (rimBand * 0.34 + glare) * (1.0 - diss);
+      gl_FragColor = vec4(uRim, alpha);
+    }
+  `,
+});
+const shell = new THREE.Mesh(new THREE.SphereGeometry(1, 160, 160), shellMaterial);
+shell.renderOrder = 0;
+
+// ---------- Group (fixed on screen; rotates gently in place) ----------
+const group = new THREE.Group();
+group.add(shell, cloud, grid);
+scene.add(group);
+
+// ---------- AEVA 3D logo inside the orb ----------
+// The "A" mark path from aeva-logo-teal.svg (first path of the wordmark)
+const SVG_A = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 551 541">
+<path d="M111.369 282.731C116.625 261.482 127.872 254.94 144.912 256.268C161.472 257.596 178.23 256.526 201.685 256.526C185.747 297.63 171.9 333.355 156.781 372.418H391.163C335.83 247.004 282.279 125.639 226.949 0.257968C256.847 0.257968 282.082 -0.64895 307.204 0.938156C312.969 1.32683 320.769 8.71173 323.622 15.1573C397.973 183.423 471.786 351.98 545.57 520.57C547.52 525.04 548.254 530.253 550.826 539.81C523.414 539.81 498.405 541.073 473.594 538.903C467.688 538.384 459.522 527.502 457.542 519.695C443.215 463.823 411.452 450.348 362.564 454.073C289.881 459.612 216.605 455.855 143.613 455.238C127.985 455.078 119.112 459.677 111.991 477.555C86.6989 541.267 85.9357 540.877 24.6136 540.068C17.9445 539.939 11.2754 539.161 0 538.352C37.8671 451.417 74.2083 367.915 111.369 282.568V282.731Z"/>
+</svg>`;
+
+const COLOR_DARK = new THREE.Color('#2F6873');
+const COLOR_LIGHT = new THREE.Color('#59C4D9');
+
+function buildLogoGeometry() {
+  const loader = new SVGLoader();
+  const data = loader.parse(SVG_A);
+  const shapes = data.paths.flatMap((p) => SVGLoader.createShapes(p));
+
+  const geometry = new THREE.ExtrudeGeometry(shapes, {
+    depth: 80,
+    steps: 1,
+    curveSegments: 24,
+    bevelEnabled: true,
+    bevelThickness: 7,
+    bevelSize: 7,
+    bevelSegments: 5,
+  });
+
+  // Scale to ~1.15 world units tall so it sits comfortably inside the
+  // radius-1 orb, and center at origin
+  const scale = 1.15 / 541;
+  geometry.scale(scale, scale, scale);
+  geometry.center();
+
+  // Bake the brand gradient into vertex colors.
+  // SVG space is y-down, so the visual TOP of the logo has the SMALLEST y here.
+  geometry.computeBoundingBox();
+  const bb = geometry.boundingBox;
+  const pos = geometry.getAttribute('position');
+  const colors = new Float32Array(pos.count * 3);
+  const tmp = new THREE.Color();
+  const h = bb.max.y - bb.min.y;
+  const w = bb.max.x - bb.min.x;
+  for (let i = 0; i < pos.count; i++) {
+    const ty = (bb.max.y - pos.getY(i)) / h; // 1 at visual top
+    const tx = (pos.getX(i) - bb.min.x) / w;
+    const t = THREE.MathUtils.clamp(0.85 * ty + 0.15 * tx, 0, 1);
+    tmp.lerpColors(COLOR_DARK, COLOR_LIGHT, t);
+    colors[i * 3] = tmp.r;
+    colors[i * 3 + 1] = tmp.g;
+    colors[i * 3 + 2] = tmp.b;
+  }
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  return geometry;
+}
+
+const logoGeometry = buildLogoGeometry();
+const logoMaterial = new THREE.MeshPhysicalMaterial({
+  vertexColors: true,
+  metalness: 0.35,
+  roughness: 0.22,
+  clearcoat: 1,
+  clearcoatRoughness: 0.15,
+  envMapIntensity: 1.1,
+});
+const logoMesh = new THREE.Mesh(logoGeometry, logoMaterial);
+// SVG is y-down; a 180° rotation about X flips it upright without
+// mirroring winding order
+logoMesh.rotation.x = Math.PI;
+
+// Own group so its mouse-tilt is independent of the orb's slow spin
+const logoGroup = new THREE.Group();
+logoGroup.add(logoMesh);
+scene.add(logoGroup);
+
+// Lights for the logo (the orb's shader materials ignore them)
+scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+const keyLight = new THREE.DirectionalLight(0xffffff, 1.4);
+keyLight.position.set(5, 8, 6);
+scene.add(keyLight);
+const fillLight = new THREE.DirectionalLight(new THREE.Color('#59C4D9'), 0.4);
+fillLight.position.set(-6, -2, -4);
+scene.add(fillLight);
+
+// ---------- Soft halo glow behind the orb ----------
+function makeHaloTexture(){
+  const c = document.createElement('canvas');
+  c.width = c.height = 512;
+  const ctx = c.getContext('2d');
+  const g = ctx.createRadialGradient(256, 256, 0, 256, 256, 256);
+  g.addColorStop(0.0, 'rgba(255,255,255,0.75)');
+  g.addColorStop(0.4, 'rgba(224,246,252,0.35)');
+  g.addColorStop(0.7, 'rgba(203,238,248,0.12)');
+  g.addColorStop(1.0, 'rgba(203,238,248,0.0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, 512, 512);
+  return new THREE.CanvasTexture(c);
+}
+const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+  map: makeHaloTexture(),
+  transparent: true,
+  depthWrite: false,
+  depthTest: false,
+}));
+halo.scale.setScalar(3.4);
+halo.renderOrder = -1;
+scene.add(halo);
+
+// ---------- Hover tracking (ray vs. orb sphere) ----------
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2(10, 10);
+const tiltPointer = new THREE.Vector2(0, 0); // normalized cursor for logo tilt
+const hoverSphere = new THREE.Sphere(new THREE.Vector3(0, 0, 0), 1.15);
+const hitPoint = new THREE.Vector3();
+const mouseWorld = new THREE.Vector3(0, 0, 1.2);
+const mouseSmoothed = new THREE.Vector3(0, 0, 1.2);
+let hovered = false;
+
+addEventListener('pointermove', (e) => {
+  pointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  tiltPointer.copy(pointer);
+  raycaster.setFromCamera(pointer, camera);
+  hoverSphere.center.copy(group.position);
+  hoverSphere.radius = 1.15 * group.scale.x;
+  const hit = raycaster.ray.intersectSphere(hoverSphere, hitPoint);
+  hovered = hit !== null;
+  if (hovered) mouseWorld.copy(hitPoint);
+});
+addEventListener('pointerleave', () => { hovered = false; });
+document.addEventListener('mouseleave', () => { hovered = false; });
+
+// ---------- Animate ----------
+const clock = new THREE.Clock();
+let hover = 0;
+
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+  uniforms.uTime.value = t;
+
+  const breathe = 1.0 + 0.012 * Math.sin(t * 0.6);
+  group.scale.setScalar(breathe);
+  group.rotation.y = t * 0.05;
+
+  // The logo breathes with the orb but tilts toward the mouse on its own
+  logoGroup.scale.setScalar(breathe);
+  const targetY = tiltPointer.x * 0.7;   // look left/right
+  const targetX = -tiltPointer.y * 0.55; // look up/down
+  logoGroup.rotation.y = THREE.MathUtils.damp(logoGroup.rotation.y, targetY, 6, dt);
+  logoGroup.rotation.x = THREE.MathUtils.damp(logoGroup.rotation.x, targetX, 6, dt);
+
+  // Damped spring: split opens quickly, closes a touch slower
+  const target = hovered ? 1 : 0;
+  hover += (target - hover) * (1 - Math.exp(-dt * (hovered ? 7 : 3.2)));
+  uniforms.uHover.value = hover;
+
+  // Smooth the cursor point and hand it to the shaders in orb-local space
+  mouseSmoothed.lerp(mouseWorld, 1 - Math.exp(-dt * 12));
+  uniforms.uMouse.value.copy(group.worldToLocal(mouseSmoothed.clone()));
+
+  // Split plane: vertical seam through the cursor (screen-horizontal normal),
+  // expressed in orb-local space so it tracks the orb's rotation
+  uniforms.uSplitN.value.set(1, 0, 0)
+    .applyQuaternion(group.quaternion.clone().invert())
+    .normalize();
+
+  // Halo softens just a touch while the cursor digs into the orb
+  halo.material.opacity = 1 - hover * 0.2;
+
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>

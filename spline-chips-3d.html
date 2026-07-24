@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AEVA Chips Ring — Brand Wreath</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #b7bcc3; }
+  #root { width: 100%; height: 100%; }
+  #vignette {
+    position: fixed; inset: 0; pointer-events: none; z-index: 5;
+    background: radial-gradient(ellipse at 50% 50%, transparent 52%, rgba(60,66,74,0.28) 84%, rgba(45,50,57,0.5) 100%);
+  }
+  #loading {
+    position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: #2F6873; letter-spacing: 0.35em; font-size: 13px; text-transform: uppercase;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    animation: pulse 1.6s ease-in-out infinite; pointer-events: none; z-index: 10;
+  }
+  @keyframes pulse { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }
+  #hint {
+    position: fixed; bottom: 18px; left: 0; right: 0; text-align: center; z-index: 6;
+    color: rgba(47,104,115,0.55); font-size: 11px; letter-spacing: 0.22em; text-transform: uppercase;
+    font-family: 'Segoe UI', system-ui, sans-serif; pointer-events: none;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+    "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
+    "three": "https://esm.sh/three@0.169.0",
+    "three/examples/jsm/loaders/SVGLoader.js": "https://esm.sh/three@0.169.0/examples/jsm/loaders/SVGLoader.js?external=three",
+    "three/examples/jsm/environments/RoomEnvironment.js": "https://esm.sh/three@0.169.0/examples/jsm/environments/RoomEnvironment.js?external=three",
+    "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.17.10?external=react,react-dom,three"
+  }
+}
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="loading">Loading Chips</div>
+<div id="root"></div>
+<div id="vignette"></div>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useMemo, useEffect, useRef } from 'react'
+import { createRoot } from 'react-dom/client'
+import * as THREE from 'three'
+import { Canvas, useThree, useFrame } from '@react-three/fiber'
+import { SVGLoader } from 'three/examples/jsm/loaders/SVGLoader.js'
+import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js'
+
+// ------------------------------------------------------------------
+// Ring parameters
+// ------------------------------------------------------------------
+const N_CHIPS   = 28
+const RADIUS    = 2.55
+const BASE_TILT = 1.05        // shingle angle around the radial axis
+const CAROUSEL  = 0.16        // ring spin speed, rad/s
+const RIPPLE_AMP = 0.30       // tilt ripple amplitude
+const RIPPLE_SPEED = 0.9
+const CHIP_SPIN = 0.55        // each chip's spin around its own axis, rad/s
+
+// ------------------------------------------------------------------
+// Chip geometry: soft guitar-pick / petal, extruded with fat bevels
+// ------------------------------------------------------------------
+function makeChipGeometry() {
+  const s = new THREE.Shape()
+  // petal pointing +X, widest near the outer end
+  s.moveTo(-0.85, 0)
+  s.quadraticCurveTo(-0.55, 0.55, 0.25, 0.62)
+  s.quadraticCurveTo(0.85, 0.62, 0.92, 0)
+  s.quadraticCurveTo(0.85, -0.62, 0.25, -0.62)
+  s.quadraticCurveTo(-0.55, -0.55, -0.85, 0)
+  const geo = new THREE.ExtrudeGeometry(s, {
+    depth: 0.07, bevelEnabled: true,
+    bevelThickness: 0.055, bevelSize: 0.09, bevelSegments: 5, curveSegments: 32
+  })
+  geo.center()
+  return geo
+}
+
+// AEVA brand chrome variants: light teal, deep teal, mid teal, silver
+function makeChipMaterials() {
+  const defs = [
+    { color: '#59C4D9', ir: 1.30 },   // AEVA light teal
+    { color: '#2F6873', ir: 1.45 },   // AEVA deep teal
+    { color: '#3E96AC', ir: 1.35 },   // blend of the two
+    { color: '#e6edf0', ir: 1.25 }    // silver accent
+  ]
+  return defs.map(d => new THREE.MeshPhysicalMaterial({
+    color: d.color, metalness: 1.0, roughness: 0.22,
+    clearcoat: 1.0, clearcoatRoughness: 0.15,
+    iridescence: 0.25, iridescenceIOR: d.ir, iridescenceThicknessRange: [120, 480]
+  }))
+}
+
+// ------------------------------------------------------------------
+// 3D "A" — the real AEVA mark, extruded from the brand SVG path
+// (ported from orb-with-logo.html, with the baked teal gradient)
+// ------------------------------------------------------------------
+const SVG_A = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 551 541">
+<path d="M111.369 282.731C116.625 261.482 127.872 254.94 144.912 256.268C161.472 257.596 178.23 256.526 201.685 256.526C185.747 297.63 171.9 333.355 156.781 372.418H391.163C335.83 247.004 282.279 125.639 226.949 0.257968C256.847 0.257968 282.082 -0.64895 307.204 0.938156C312.969 1.32683 320.769 8.71173 323.622 15.1573C397.973 183.423 471.786 351.98 545.57 520.57C547.52 525.04 548.254 530.253 550.826 539.81C523.414 539.81 498.405 541.073 473.594 538.903C467.688 538.384 459.522 527.502 457.542 519.695C443.215 463.823 411.452 450.348 362.564 454.073C289.881 459.612 216.605 455.855 143.613 455.238C127.985 455.078 119.112 459.677 111.991 477.555C86.6989 541.267 85.9357 540.877 24.6136 540.068C17.9445 539.939 11.2754 539.161 0 538.352C37.8671 451.417 74.2083 367.915 111.369 282.568V282.731Z"/>
+</svg>`
+
+const COLOR_DARK = new THREE.Color('#2F6873')
+const COLOR_LIGHT = new THREE.Color('#59C4D9')
+
+function buildLogoGeometry() {
+  const loader = new SVGLoader()
+  const data = loader.parse(SVG_A)
+  const shapes = data.paths.flatMap((p) => SVGLoader.createShapes(p))
+
+  const geometry = new THREE.ExtrudeGeometry(shapes, {
+    depth: 80,
+    steps: 1,
+    curveSegments: 24,
+    bevelEnabled: true,
+    bevelThickness: 7,
+    bevelSize: 7,
+    bevelSegments: 5
+  })
+
+  // scale to ~2.1 world units tall so it fills the ring's center
+  const scale = 2.1 / 541
+  geometry.scale(scale, scale, scale)
+  geometry.center()
+
+  // bake the brand gradient into vertex colors
+  // (SVG space is y-down, so the visual TOP has the SMALLEST y here)
+  geometry.computeBoundingBox()
+  const bb = geometry.boundingBox
+  const pos = geometry.getAttribute('position')
+  const colors = new Float32Array(pos.count * 3)
+  const tmp = new THREE.Color()
+  const h = bb.max.y - bb.min.y
+  const w = bb.max.x - bb.min.x
+  for (let i = 0; i < pos.count; i++) {
+    const ty = (bb.max.y - pos.getY(i)) / h // 1 at visual top
+    const tx = (pos.getX(i) - bb.min.x) / w
+    const t = THREE.MathUtils.clamp(0.85 * ty + 0.15 * tx, 0, 1)
+    tmp.lerpColors(COLOR_DARK, COLOR_LIGHT, t)
+    colors[i * 3] = tmp.r
+    colors[i * 3 + 1] = tmp.g
+    colors[i * 3 + 2] = tmp.b
+  }
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+  return geometry
+}
+
+const matLetter = new THREE.MeshPhysicalMaterial({
+  vertexColors: true,
+  metalness: 0.35,
+  roughness: 0.22,
+  clearcoat: 1,
+  clearcoatRoughness: 0.15,
+  envMapIntensity: 1.1
+})
+
+function LetterA() {
+  const ref = useRef()
+  const geo = useMemo(() => buildLogoGeometry(), [])
+  useFrame((state) => {
+    const t = state.clock.elapsedTime
+    if (ref.current) {
+      ref.current.rotation.y = t * 0.45
+      ref.current.position.y = Math.sin(t * 0.8) * 0.08
+    }
+  })
+  return (
+    <group ref={ref}>
+      {/* SVG is y-down; flip upright without mirroring winding order */}
+      <mesh geometry={geo} material={matLetter} rotation={[Math.PI, 0, 0]} />
+    </group>
+  )
+}
+
+// ------------------------------------------------------------------
+// The wreath: N shingled chips with a traveling tilt ripple
+// ------------------------------------------------------------------
+function ChipsRing() {
+  const chipGeo = useMemo(() => makeChipGeometry(), [])
+  const mats = useMemo(() => makeChipMaterials(), [])
+  const ringRef = useRef()
+  const groupRef = useRef()
+  const chipRefs = useRef([])
+  const spinRefs = useRef([])
+
+  const angles = useMemo(
+    () => Array.from({ length: N_CHIPS }, (_, i) => (i / N_CHIPS) * Math.PI * 2),
+    []
+  )
+
+  useFrame((state, delta) => {
+    const t = state.clock.elapsedTime
+    // carousel spin in the ring plane
+    if (ringRef.current) ringRef.current.rotation.z += delta * CAROUSEL
+    // slow cinematic precession of the whole wreath
+    if (groupRef.current) {
+      groupRef.current.rotation.y = Math.sin(t * 0.12) * 0.35
+      groupRef.current.rotation.x = 0.25 + Math.sin(t * 0.09) * 0.12
+    }
+    // traveling ripple: chips lean and bunch like a wave going around
+    chipRefs.current.forEach((ref, i) => {
+      if (!ref) return
+      ref.rotation.x = BASE_TILT + Math.sin(t * RIPPLE_SPEED + angles[i] * 2.0) * RIPPLE_AMP
+    })
+    // each chip spins around its own face axis, phase-staggered
+    spinRefs.current.forEach((ref, i) => {
+      if (!ref) return
+      ref.rotation.z = t * CHIP_SPIN + angles[i]
+    })
+  })
+
+  return (
+    <group ref={groupRef}>
+      <LetterA />
+      <group ref={ringRef}>
+        {angles.map((a, i) => (
+          // outer group: local +X points radially outward
+          <group key={i} rotation={[0, 0, a]}>
+            {/* tilt pivot at the ring line; petal tip points outward */}
+            <group
+              ref={el => (chipRefs.current[i] = el)}
+              position={[RADIUS, 0, 0]}
+              rotation={[BASE_TILT, 0, 0]}
+            >
+              <group ref={el => (spinRefs.current[i] = el)}>
+                <mesh geometry={chipGeo} material={mats[i % mats.length]} scale={[1.05, 1, 1]} />
+              </group>
+            </group>
+          </group>
+        ))}
+      </group>
+    </group>
+  )
+}
+
+// ------------------------------------------------------------------
+// Environment + controls
+// ------------------------------------------------------------------
+function SceneSetup() {
+  const { gl, scene, camera } = useThree()
+  useEffect(() => {
+    const pmrem = new THREE.PMREMGenerator(gl)
+    scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture
+    scene.environmentIntensity = 1.0
+    gl.toneMapping = THREE.ACESFilmicToneMapping
+    gl.toneMappingExposure = 1.25
+    document.getElementById('loading').style.display = 'none'
+    return () => pmrem.dispose()
+  }, [gl, scene])
+
+  return null
+}
+
+function App() {
+  return (
+    <Canvas
+      dpr={[1, 2]}
+      camera={{ position: [0, 0.3, 11], fov: 42 }}
+      gl={{ antialias: true }}
+      style={{ background: '#b7bcc3' }}
+    >
+      <color attach="background" args={['#b7bcc3']} />
+      <fog attach="fog" args={['#b7bcc3', 15, 30]} />
+      {/* bright white rims */}
+      <directionalLight position={[3, 7, 6]} intensity={2.2} color="#ffffff" />
+      <directionalLight position={[-6, -3, 4]} intensity={1.0} color="#eef6f8" />
+      {/* AEVA teal washes */}
+      <pointLight position={[6, -4, 5]} intensity={80} color="#59C4D9" distance={26} decay={2} />
+      <pointLight position={[-7, 4, 3]} intensity={70} color="#2F6873" distance={26} decay={2} />
+      <pointLight position={[0, 6, -4]} intensity={45} color="#9fdceb" distance={22} decay={2} />
+      <ambientLight intensity={0.25} color="#8fa6ad" />
+      <ChipsRing />
+      <SceneSetup />
+    </Canvas>
+  )
+}
+
+createRoot(document.getElementById('root')).render(<App />)
+</script>
+</body>
+</html>

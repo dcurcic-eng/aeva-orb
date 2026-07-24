@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>AEVA — Gyroscope (R3F)</title>
+<style>
+  html, body { margin:0; padding:0; width:100%; height:100%; background:#989c9f; overflow:hidden; font-family:'Segoe UI', system-ui, sans-serif; }
+  #root { width:100%; height:100%; }
+  .loading { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+    color:#555; font-size:12px; letter-spacing:3px; text-transform:uppercase; z-index:5; }
+  .badge { position:fixed; left:18px; bottom:16px; color:#4a4f54; font-size:11px; letter-spacing:2px;
+    text-transform:uppercase; z-index:6; opacity:.7; pointer-events:none; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "react": "https://esm.sh/react@18.3.1",
+    "react/jsx-runtime": "https://esm.sh/react@18.3.1/jsx-runtime",
+    "react-dom": "https://esm.sh/react-dom@18.3.1?external=react",
+    "react-dom/client": "https://esm.sh/react-dom@18.3.1/client?external=react",
+    "three": "https://esm.sh/three@0.160.0",
+    "@react-three/fiber": "https://esm.sh/@react-three/fiber@8.17.10?external=react,react-dom,three",
+    "@react-three/drei": "https://esm.sh/@react-three/drei@9.114.3?external=react,react-dom,three,@react-three/fiber",
+    "@react-three/postprocessing": "https://esm.sh/@react-three/postprocessing@2.16.3?external=react,three,@react-three/fiber"
+  }
+}
+</script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div class="loading" id="loading">Loading…</div>
+<div class="badge">AEVA · Gyroscope</div>
+<div id="root"></div>
+
+<script type="text/babel" data-type="module" data-presets="react">
+import React, { useRef, useMemo, useEffect, Suspense } from 'react'
+import { createRoot } from 'react-dom/client'
+import * as THREE from 'three'
+import { Canvas, useFrame } from '@react-three/fiber'
+import { Environment, Lightformer, OrbitControls, MeshReflectorMaterial, ContactShadows } from '@react-three/drei'
+import { EffectComposer, Bloom, Vignette } from '@react-three/postprocessing'
+
+/* ============================================================
+   Palette & shared materials — matched to the reference video:
+   polished chrome rings, dark indigo-navy base, cyan neon glow
+   ============================================================ */
+const CYAN       = '#3fdcff'
+const CYAN_DEEP  = '#18b8e8'
+const NAVY       = '#151f2f'
+const CHROME     = '#e2e7ec'
+
+function useMats() {
+  return useMemo(() => {
+    const chrome = new THREE.MeshPhysicalMaterial({
+      color: CHROME, metalness: 1.0, roughness: 0.14,
+      envMapIntensity: 1.5, clearcoat: 0.6, clearcoatRoughness: 0.18
+    })
+    const chromeDark = new THREE.MeshPhysicalMaterial({
+      color: '#aeb6bf', metalness: 1.0, roughness: 0.24,
+      envMapIntensity: 1.2, clearcoat: 0.4, clearcoatRoughness: 0.25
+    })
+    const navy = new THREE.MeshPhysicalMaterial({
+      color: NAVY, metalness: 0.85, roughness: 0.34,
+      envMapIntensity: 0.9, clearcoat: 1.0, clearcoatRoughness: 0.28
+    })
+    const glow = new THREE.MeshStandardMaterial({
+      color: '#02222e', emissive: CYAN, emissiveIntensity: 2.6, toneMapped: false,
+      metalness: 0, roughness: 0.4
+    })
+    const glowSoft = new THREE.MeshStandardMaterial({
+      color: '#02222e', emissive: CYAN_DEEP, emissiveIntensity: 1.6, toneMapped: false,
+      metalness: 0, roughness: 0.5
+    })
+    return { chrome, chromeDark, navy, glow, glowSoft }
+  }, [])
+}
+
+/* ============================================================
+   Geometry helpers
+   ============================================================ */
+
+/* Flat rectangular-section ring (annulus extruded), like the
+   machined chrome bands in the video */
+function ringGeo(inner, outer, depth) {
+  const s = new THREE.Shape()
+  s.absarc(0, 0, outer, 0, Math.PI * 2, false)
+  const h = new THREE.Path()
+  h.absarc(0, 0, inner, 0, Math.PI * 2, true)
+  s.holes.push(h)
+  const g = new THREE.ExtrudeGeometry(s, {
+    depth, bevelEnabled: true, bevelThickness: 0.012, bevelSize: 0.012,
+    bevelSegments: 2, curveSegments: 128
+  })
+  g.translate(0, 0, -depth / 2)
+  return g
+}
+
+/* Tri-lobed sculpted base — lathe with 3-lobe radial modulation,
+   strongest at the skirt, fading to circular at the neck */
+const BASE_H = 1.05
+const baseR    = t => 0.34 + 1.42 * Math.pow(1 - t, 2.1)
+const baseAmp  = t => 0.20 * Math.pow(1 - t, 1.7)
+const Z_SQUASH = 0.90
+
+function basePoint(theta, t, offset = 0) {
+  const r = (baseR(t) * (1 + baseAmp(t) * Math.cos(3 * theta + Math.PI / 2))) + offset
+  return new THREE.Vector3(r * Math.cos(theta), t * BASE_H, r * Math.sin(theta) * Z_SQUASH)
+}
+
+function makeBaseGeo(t0, t1, rows, segs, offset, capBottom, capTop) {
+  const pos = [], idx = []
+  for (let i = 0; i <= rows; i++) {
+    const t = t0 + (t1 - t0) * (i / rows)
+    for (let j = 0; j <= segs; j++) {
+      const p = basePoint((j / segs) * Math.PI * 2, t, offset)
+      pos.push(p.x, p.y, p.z)
+    }
+  }
+  const W = segs + 1
+  for (let i = 0; i < rows; i++)
+    for (let j = 0; j < segs; j++) {
+      const a = i * W + j, b = a + W
+      idx.push(a, b, a + 1, b, b + 1, a + 1)
+    }
+  const capRing = (t, up) => {
+    const cIdx = pos.length / 3
+    pos.push(0, t * BASE_H, 0)
+    const start = pos.length / 3
+    for (let j = 0; j <= segs; j++) {
+      const p = basePoint((j / segs) * Math.PI * 2, t, offset)
+      pos.push(p.x, p.y, p.z)
+    }
+    for (let j = 0; j < segs; j++)
+      up ? idx.push(cIdx, start + j, start + j + 1)
+         : idx.push(cIdx, start + j + 1, start + j)
+  }
+  if (capBottom) capRing(t0, false)
+  if (capTop) capRing(t1, true)
+  const g = new THREE.BufferGeometry()
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3))
+  g.setIndex(idx)
+  g.computeVertexNormals()
+  return g
+}
+
+/* Neon seam line swooping around the base skirt (V-dip at front) */
+function makeSeamCurve(baseY, dip, offset) {
+  const pts = []
+  for (let j = 0; j < 160; j++) {
+    const th = (j / 160) * Math.PI * 2
+    const front = Math.max(0, Math.cos(th - Math.PI / 2)) // dips toward +z (front)
+    const y = baseY - dip * Math.pow(front, 1.6)
+    const t = THREE.MathUtils.clamp(y / BASE_H, 0, 1)
+    pts.push(basePoint(th, t, offset))
+  }
+  return new THREE.CatmullRomCurve3(pts, true, 'catmullrom', 0.5)
+}
+
+/* ============================================================
+   Base + yoke stand
+   ============================================================ */
+function Stand({ mats, yc, hubX }) {
+  const bodyGeo = useMemo(() => makeBaseGeo(0.04, 1, 48, 160, 0, false, true), [])
+  const rimGeo  = useMemo(() => makeBaseGeo(0, 0.05, 4, 160, 0.02, true, false), [])
+  const seamA   = useMemo(() => new THREE.TubeGeometry(makeSeamCurve(0.50, 0.30, 0.012), 320, 0.010, 10, true), [])
+  const seamB   = useMemo(() => new THREE.TubeGeometry(makeSeamCurve(0.12, 0.0, 0.012), 320, 0.007, 8, true), [])
+
+  /* one yoke arm: flattened capsule leaning from skirt up to the pivot hub */
+  const Arm = ({ side }) => {
+    const p0 = new THREE.Vector3(side * 0.72, 0.42, 0)
+    const p1 = new THREE.Vector3(side * hubX, yc, 0)
+    const mid = p0.clone().add(p1).multiplyScalar(0.5)
+    const dir = p1.clone().sub(p0)
+    const len = dir.length()
+    const quat = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.normalize())
+    return (
+      <group position={mid} quaternion={quat}>
+        <mesh material={mats.navy} scale={[1, 1, 0.52]}>
+          <capsuleGeometry args={[0.14, len - 0.1, 8, 24]} />
+        </mesh>
+        {/* chrome edge trim on the blade */}
+        <mesh material={mats.chromeDark} position={[side * 0.02, 0, 0]} scale={[1, 1, 0.3]}>
+          <capsuleGeometry args={[0.155, len - 0.35, 6, 20]} />
+        </mesh>
+      </group>
+    )
+  }
+
+  /* chrome pivot hub on each arm */
+  const Hub = ({ side }) => (
+    <group position={[side * hubX, yc, 0]} rotation={[0, 0, Math.PI / 2]}>
+      <mesh material={mats.chrome}><cylinderGeometry args={[0.15, 0.15, 0.16, 48]} /></mesh>
+      <mesh material={mats.navy} position={[side * -0.0, 0.0, 0]}>
+        <cylinderGeometry args={[0.10, 0.10, 0.185, 48]} />
+      </mesh>
+      <mesh material={mats.chrome}><cylinderGeometry args={[0.045, 0.045, 0.22, 24]} /></mesh>
+      <mesh material={mats.glowSoft} rotation={[Math.PI / 2, 0, 0]} position={[0, side * 0.0, 0]}>
+        <torusGeometry args={[0.125, 0.006, 8, 48]} />
+      </mesh>
+    </group>
+  )
+
+  return (
+    <group>
+      <mesh geometry={bodyGeo} material={mats.navy} />
+      <mesh geometry={rimGeo} material={mats.chromeDark} />
+      <mesh geometry={seamA} material={mats.glow} />
+      <mesh geometry={seamB} material={mats.glowSoft} />
+      {/* neck collar where the arms meet the body */}
+      <mesh material={mats.chromeDark} position={[0, BASE_H + 0.02, 0]}>
+        <cylinderGeometry args={[0.26, 0.34, 0.10, 48]} />
+      </mesh>
+      <Arm side={1} /><Arm side={-1} />
+      <Hub side={1} /><Hub side={-1} />
+    </group>
+  )
+}
+
+/* ============================================================
+   Gimbal rings — each spins CONTINUOUSLY around its own axis
+   (improved over the video's back-and-forth rocking)
+   ============================================================ */
+function Gimbal({ mats, yc }) {
+  const g1 = useRef()   // outer ring  → spins on horizontal X pivot axis
+  const g2 = useRef()   // middle ring → spins on its vertical Y axis
+  const rotor = useRef() // core rotor  → fast spin on its own spindle
+  const orbMat = useRef()
+  const halo = useRef()
+
+  useFrame((state, delta) => {
+    const t = state.clock.elapsedTime
+    g1.current.rotation.x += delta * 0.32
+    g2.current.rotation.y += delta * 0.55
+    rotor.current.rotation.y += delta * 2.1
+    const pulse = 2.3 + Math.sin(t * 2.4) * 0.5
+    orbMat.current.emissiveIntensity = pulse
+    if (halo.current) halo.current.material.opacity = 0.16 + Math.sin(t * 2.4) * 0.05
+  })
+
+  const outerGeo  = useMemo(() => ringGeo(1.38, 1.52, 0.10), [])
+  const midGeo    = useMemo(() => ringGeo(1.08, 1.20, 0.08), [])
+  const bandGeo   = useMemo(() => ringGeo(0.72, 1.02, 0.05), [])
+  const innerGeo  = useMemo(() => ringGeo(0.58, 0.66, 0.05), [])
+
+  const GlowLoop = ({ r, tube = 0.013, rot = [0, 0, 0], mat = mats.glow }) => (
+    <mesh rotation={rot} material={mat}>
+      <torusGeometry args={[r, tube, 10, 160]} />
+    </mesh>
+  )
+
+  const Ball = ({ p, r = 0.05 }) => (
+    <mesh position={p} material={mats.chrome}>
+      <sphereGeometry args={[r, 24, 24]} />
+    </mesh>
+  )
+
+  return (
+    <group position={[0, yc, 0]}>
+      {/* ------ outer gimbal: full revolutions about the X pivot axis ------ */}
+      <group ref={g1}>
+        <mesh geometry={outerGeo} material={mats.chrome} />
+        <GlowLoop r={1.40} />
+        {/* stub shafts out to the yoke hubs */}
+        {[1, -1].map(s => (
+          <mesh key={s} material={mats.chrome} position={[s * 1.60, 0, 0]} rotation={[0, 0, Math.PI / 2]}>
+            <cylinderGeometry args={[0.04, 0.04, 0.22, 24]} />
+          </mesh>
+        ))}
+        {/* bearings for the middle ring, top & bottom */}
+        {[1, -1].map(s => (
+          <group key={s}>
+            <mesh material={mats.chrome} position={[0, s * 1.29, 0]}>
+              <cylinderGeometry args={[0.032, 0.032, 0.20, 20]} />
+            </mesh>
+            <Ball p={[0, s * 1.36, 0]} r={0.055} />
+          </group>
+        ))}
+
+        {/* ------ middle gimbal: continuous spin about vertical Y ------ */}
+        <group ref={g2}>
+          <mesh geometry={midGeo} material={mats.chrome} />
+          <GlowLoop r={1.10} tube={0.011} />
+          {/* axle bearings for the rotor */}
+          {[1, -1].map(s => <Ball key={s} p={[0, s * 1.05, 0]} r={0.05} />)}
+
+          {/* ------ rotor: fast spin around its own spindle ------ */}
+          <group ref={rotor}>
+            {/* wide flat equatorial band */}
+            <mesh geometry={bandGeo} rotation={[Math.PI / 2, 0, 0]} material={mats.chrome} />
+            <GlowLoop r={0.735} tube={0.012} rot={[Math.PI / 2, 0, 0]} />
+            <GlowLoop r={1.005} tube={0.009} rot={[Math.PI / 2, 0, 0]} mat={mats.glowSoft} />
+
+            {/* inner vertical ring */}
+            <mesh geometry={innerGeo} material={mats.chrome} />
+            <GlowLoop r={0.60} tube={0.009} mat={mats.glowSoft} />
+
+            {/* vertical spindle */}
+            <mesh material={mats.chrome}>
+              <cylinderGeometry args={[0.024, 0.024, 2.06, 20]} />
+            </mesh>
+            {[0.26, -0.26].map(y => (
+              <mesh key={y} material={mats.chrome} position={[0, y, 0]}>
+                <cylinderGeometry args={[0.045, 0.045, 0.09, 20]} />
+              </mesh>
+            ))}
+
+            {/* four spokes with ball joints, orb → flat band */}
+            {[0, 1, 2, 3].map(k => {
+              const a = (k * Math.PI) / 2
+              const dx = Math.round(Math.cos(a)), dz = Math.round(Math.sin(a))
+              return (
+                <group key={k}>
+                  <mesh material={mats.chrome}
+                        position={[dx * 0.445, 0, dz * 0.445]}
+                        rotation={[dz !== 0 ? Math.PI / 2 : 0, 0, dx !== 0 ? Math.PI / 2 : 0]}>
+                    <cylinderGeometry args={[0.020, 0.020, 0.53, 16]} />
+                  </mesh>
+                  <Ball p={[dx * 0.70, 0, dz * 0.70]} r={0.05} />
+                  <Ball p={[dx * 0.34, 0, dz * 0.34]} r={0.034} />
+                </group>
+              )
+            })}
+
+            {/* glowing plasma core */}
+            <mesh>
+              <sphereGeometry args={[0.185, 48, 48]} />
+              <meshStandardMaterial ref={orbMat} color="#032a38" emissive={CYAN}
+                emissiveIntensity={2.3} toneMapped={false} roughness={0.25} />
+            </mesh>
+            <mesh ref={halo}>
+              <sphereGeometry args={[0.27, 32, 32]} />
+              <meshBasicMaterial color={CYAN} transparent opacity={0.16}
+                blending={THREE.AdditiveBlending} depthWrite={false} toneMapped={false} />
+            </mesh>
+            <pointLight color={CYAN} intensity={2.6} distance={7} decay={2} />
+          </group>
+        </group>
+      </group>
+    </group>
+  )
+}
+
+/* ============================================================
+   Studio environment — seamless gray cyc like the video
+   ============================================================ */
+function Studio() {
+  return (
+    <>
+      <color attach="background" args={['#9b9fa2']} />
+      <fog attach="fog" args={['#9b9fa2', 12, 34]} />
+      <ambientLight intensity={0.22} />
+
+      <Environment resolution={256} frames={1}>
+        <Lightformer form="rect" intensity={3} position={[0, 7, 0]} rotation-x={Math.PI / 2} scale={[9, 9, 1]} />
+        <Lightformer form="rect" intensity={1.4} position={[-7, 3, 1]} rotation-y={Math.PI / 2} scale={[7, 3.5, 1]} />
+        <Lightformer form="rect" intensity={1.4} position={[7, 3, 1]} rotation-y={-Math.PI / 2} scale={[7, 3.5, 1]} />
+        <Lightformer form="rect" intensity={0.8} position={[0, 3.5, 9]} scale={[11, 4, 1]} />
+        <Lightformer form="rect" intensity={0.5} position={[0, 2, -9]} scale={[10, 4, 1]} />
+      </Environment>
+
+      {/* softly reflective studio floor */}
+      <mesh rotation-x={-Math.PI / 2} position={[0, -0.002, 0]}>
+        <planeGeometry args={[70, 70]} />
+        <MeshReflectorMaterial
+          blur={[380, 120]} resolution={1024} mixBlur={1} mixStrength={0.3}
+          roughness={0.95} depthScale={1.1} minDepthThreshold={0.4} maxDepthThreshold={1.4}
+          color="#8f9396" metalness={0.1} mirror={0.18} />
+      </mesh>
+      <ContactShadows position={[0, 0.004, 0]} scale={9} blur={2.6} far={3} opacity={0.55} />
+    </>
+  )
+}
+
+/* ============================================================
+   App
+   ============================================================ */
+const YC = 2.62         // gimbal centre height
+const HUB_X = 1.78      // yoke pivot reach
+
+function App() {
+  useEffect(() => {
+    const el = document.getElementById('loading')
+    if (el) el.style.display = 'none'
+  }, [])
+
+  return (
+    <Canvas dpr={[1, 2]} gl={{ antialias: true }}
+            camera={{ position: [0.6, 2.4, 7.6], fov: 32 }}>
+      <Suspense fallback={null}>
+        <Studio />
+        <Stand mats={useMats()} yc={YC} hubX={HUB_X} />
+        <Gimbal mats={useMats()} yc={YC} />
+        <EffectComposer multisampling={4}>
+          <Bloom luminanceThreshold={1.0} luminanceSmoothing={0.2} intensity={1.0} mipmapBlur radius={0.7} />
+          <Vignette offset={0.22} darkness={0.55} />
+        </EffectComposer>
+        <OrbitControls target={[0, 1.95, 0]} enableDamping dampingFactor={0.08}
+          autoRotate autoRotateSpeed={0.5} minDistance={4} maxDistance={14}
+          maxPolarAngle={Math.PI * 0.52} />
+      </Suspense>
+    </Canvas>
+  )
+}
+
+createRoot(document.getElementById('root')).render(<App />)
+</script>
+</body>
+</html>
